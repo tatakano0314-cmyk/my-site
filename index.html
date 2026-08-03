@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <title>期初懇親会</title>
   <style>
@@ -49,6 +49,7 @@
       padding: 10px 16px;
       background: var(--panel);
       border-bottom: 1px solid #2a3441;
+      z-index: 2;
     }
 
     header h1 {
@@ -75,7 +76,18 @@
       padding: 12px;
       min-height: 0;
       position: relative;
-      touch-action: pan-y;
+      overflow: hidden;
+      touch-action: none;
+      cursor: grab;
+      background: var(--bg);
+    }
+
+    .stage.is-panning {
+      cursor: grabbing;
+    }
+
+    .stage.is-zoomed {
+      background: #000;
     }
 
     .slide-frame {
@@ -84,6 +96,8 @@
       display: flex;
       align-items: center;
       justify-content: center;
+      transform-origin: center center;
+      will-change: transform;
     }
 
     #slide-image {
@@ -96,6 +110,28 @@
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.45);
       user-select: none;
       -webkit-user-drag: none;
+      pointer-events: none;
+    }
+
+    .zoom-hint {
+      position: absolute;
+      left: 50%;
+      bottom: 10px;
+      transform: translateX(-50%);
+      background: rgba(15, 20, 25, 0.72);
+      color: var(--muted);
+      font-size: 0.75rem;
+      padding: 6px 10px;
+      border-radius: 999px;
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.25s ease;
+      z-index: 1;
+      white-space: nowrap;
+    }
+
+    .zoom-hint.is-visible {
+      opacity: 1;
     }
 
     nav.controls {
@@ -108,6 +144,7 @@
       background: var(--panel);
       border-top: 1px solid #2a3441;
       min-height: var(--nav-h);
+      z-index: 2;
     }
 
     .nav-btn {
@@ -137,10 +174,6 @@
       color: #8a96a3;
       cursor: not-allowed;
       opacity: 0.85;
-    }
-
-    .device-badge {
-      display: none;
     }
 
     /* モバイル向け調整 */
@@ -196,15 +229,6 @@
       }
     }
 
-    /* PC: キーボード操作ヒント */
-    @media (min-width: 769px) and (hover: hover) {
-      .hint {
-        color: var(--muted);
-        font-size: 0.8rem;
-        margin-left: 8px;
-      }
-    }
-
     .hint {
       display: none;
     }
@@ -212,6 +236,9 @@
     @media (min-width: 769px) and (hover: hover) {
       .hint {
         display: inline;
+        color: var(--muted);
+        font-size: 0.8rem;
+        margin-left: 8px;
       }
     }
   </style>
@@ -226,9 +253,10 @@
   </header>
 
   <main class="stage" id="stage">
-    <div class="slide-frame">
+    <div class="slide-frame" id="slide-frame">
       <img id="slide-image" src="slides/slide01.png" alt="スライド 1" />
     </div>
+    <div class="zoom-hint" id="zoom-hint">ピンチ／ダブルタップで拡大</div>
   </main>
 
   <nav class="controls" aria-label="ページ移動">
@@ -239,12 +267,37 @@
   <script>
     (function () {
       var TOTAL = 20;
+      var MIN_SCALE = 1;
+      var MAX_SCALE = 4;
+      var DOUBLE_TAP_SCALE = 2.5;
+      var DOUBLE_TAP_MS = 280;
+
       var current = 1;
       var img = document.getElementById("slide-image");
+      var frame = document.getElementById("slide-frame");
+      var stage = document.getElementById("stage");
       var indicator = document.getElementById("page-indicator");
       var btnPrev = document.getElementById("btn-prev");
       var btnNext = document.getElementById("btn-next");
       var hint = document.getElementById("device-hint");
+      var zoomHint = document.getElementById("zoom-hint");
+
+      var scale = 1;
+      var tx = 0;
+      var ty = 0;
+
+      var pointers = new Map();
+      var pinchStartDist = 0;
+      var pinchStartScale = 1;
+      var panStartX = 0;
+      var panStartY = 0;
+      var panOriginTx = 0;
+      var panOriginTy = 0;
+      var moved = false;
+      var lastTapTime = 0;
+      var lastTapX = 0;
+      var lastTapY = 0;
+      var hintTimer = null;
 
       function pad(n) {
         return n < 10 ? "0" + n : String(n);
@@ -264,7 +317,9 @@
           /Android|iPhone|iPad|iPod|Mobile|Windows Phone/i.test(ua);
         document.body.setAttribute("data-device", isMobile ? "mobile" : "pc");
         if (hint) {
-          hint.textContent = isMobile ? "（モバイル表示）" : "（← → キーでも移動可）";
+          hint.textContent = isMobile
+            ? "（ピンチで拡大）"
+            : "（ホイール拡大 / ←→移動）";
         }
         return isMobile;
       }
@@ -275,7 +330,80 @@
         pre.src = slideSrc(n);
       }
 
+      function clamp(v, min, max) {
+        return Math.min(max, Math.max(min, v));
+      }
+
+      function applyTransform(animate) {
+        if (animate) {
+          frame.style.transition = "transform 0.2s ease";
+        } else {
+          frame.style.transition = "none";
+        }
+        frame.style.transform =
+          "translate(" + tx + "px, " + ty + "px) scale(" + scale + ")";
+        stage.classList.toggle("is-zoomed", scale > 1.01);
+      }
+
+      function getBounds() {
+        var rect = stage.getBoundingClientRect();
+        var iw = img.offsetWidth || rect.width;
+        var ih = img.offsetHeight || rect.height;
+        var scaledW = iw * scale;
+        var scaledH = ih * scale;
+        var maxX = Math.max(0, (scaledW - rect.width) / 2);
+        var maxY = Math.max(0, (scaledH - rect.height) / 2);
+        return { maxX: maxX, maxY: maxY };
+      }
+
+      function clampPan() {
+        var b = getBounds();
+        tx = clamp(tx, -b.maxX, b.maxX);
+        ty = clamp(ty, -b.maxY, b.maxY);
+      }
+
+      function resetZoom(animate) {
+        scale = 1;
+        tx = 0;
+        ty = 0;
+        applyTransform(!!animate);
+      }
+
+      function setZoomAt(nextScale, clientX, clientY, animate) {
+        var rect = stage.getBoundingClientRect();
+        var cx = clientX - rect.left - rect.width / 2;
+        var cy = clientY - rect.top - rect.height / 2;
+        var prev = scale;
+        nextScale = clamp(nextScale, MIN_SCALE, MAX_SCALE);
+
+        if (nextScale === prev) return;
+
+        // ズーム中心を指の位置に合わせる
+        tx = cx - ((cx - tx) * nextScale) / prev;
+        ty = cy - ((cy - ty) * nextScale) / prev;
+        scale = nextScale;
+
+        if (scale <= 1.01) {
+          scale = 1;
+          tx = 0;
+          ty = 0;
+        } else {
+          clampPan();
+        }
+        applyTransform(!!animate);
+      }
+
+      function showZoomHintBriefly() {
+        if (!zoomHint) return;
+        zoomHint.classList.add("is-visible");
+        clearTimeout(hintTimer);
+        hintTimer = setTimeout(function () {
+          zoomHint.classList.remove("is-visible");
+        }, 2200);
+      }
+
       function update() {
+        resetZoom(false);
         img.src = slideSrc(current);
         img.alt = "スライド " + current;
         indicator.textContent = current + " / " + TOTAL;
@@ -292,10 +420,162 @@
         update();
       }
 
-      btnPrev.addEventListener("click", function () { go(-1); });
-      btnNext.addEventListener("click", function () { go(1); });
+      function distance(a, b) {
+        var dx = a.x - b.x;
+        var dy = a.y - b.y;
+        return Math.sqrt(dx * dx + dy * dy);
+      }
+
+      function pointerList() {
+        return Array.from(pointers.values());
+      }
+
+      stage.addEventListener("pointerdown", function (e) {
+        stage.setPointerCapture(e.pointerId);
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+        moved = false;
+        stage.classList.add("is-panning");
+
+        var pts = pointerList();
+        if (pts.length === 1) {
+          panStartX = e.clientX;
+          panStartY = e.clientY;
+          panOriginTx = tx;
+          panOriginTy = ty;
+        } else if (pts.length === 2) {
+          pinchStartDist = distance(pts[0], pts[1]);
+          pinchStartScale = scale;
+        }
+      });
+
+      stage.addEventListener("pointermove", function (e) {
+        if (!pointers.has(e.pointerId)) return;
+        pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+        var pts = pointerList();
+        if (pts.length === 2) {
+          var dist = distance(pts[0], pts[1]);
+          if (pinchStartDist > 0) {
+            var midX = (pts[0].x + pts[1].x) / 2;
+            var midY = (pts[0].y + pts[1].y) / 2;
+            var next = pinchStartScale * (dist / pinchStartDist);
+            setZoomAt(next, midX, midY, false);
+            moved = true;
+          }
+          return;
+        }
+
+        if (pts.length === 1 && scale > 1.01) {
+          var dx = e.clientX - panStartX;
+          var dy = e.clientY - panStartY;
+          if (Math.abs(dx) > 3 || Math.abs(dy) > 3) moved = true;
+          tx = panOriginTx + dx;
+          ty = panOriginTy + dy;
+          clampPan();
+          applyTransform(false);
+        } else if (pts.length === 1) {
+          var adx = Math.abs(e.clientX - panStartX);
+          var ady = Math.abs(e.clientY - panStartY);
+          if (adx > 8 || ady > 8) moved = true;
+        }
+      });
+
+      function endPointer(e) {
+        if (!pointers.has(e.pointerId)) return;
+        var wasSingle = pointers.size === 1;
+        var startX = panStartX;
+        var startY = panStartY;
+        pointers.delete(e.pointerId);
+        stage.classList.remove("is-panning");
+
+        var pts = pointerList();
+        if (pts.length === 1) {
+          panStartX = pts[0].x;
+          panStartY = pts[0].y;
+          panOriginTx = tx;
+          panOriginTy = ty;
+          pinchStartDist = 0;
+          return;
+        }
+
+        if (pts.length === 0) {
+          pinchStartDist = 0;
+
+          // ダブルタップで拡大／解除
+          if (wasSingle && !moved) {
+            var now = Date.now();
+            var isDouble =
+              now - lastTapTime < DOUBLE_TAP_MS &&
+              Math.abs(e.clientX - lastTapX) < 40 &&
+              Math.abs(e.clientY - lastTapY) < 40;
+
+            if (isDouble) {
+              lastTapTime = 0;
+              if (scale > 1.01) {
+                resetZoom(true);
+              } else {
+                setZoomAt(DOUBLE_TAP_SCALE, e.clientX, e.clientY, true);
+              }
+              return;
+            }
+
+            lastTapTime = now;
+            lastTapX = e.clientX;
+            lastTapY = e.clientY;
+          }
+
+          // 未拡大時の左右スワイプでページ移動
+          if (wasSingle && scale <= 1.01 && moved) {
+            var dx = e.clientX - startX;
+            var dy = e.clientY - startY;
+            if (Math.abs(dx) >= 50 && Math.abs(dx) > Math.abs(dy)) {
+              if (dx < 0) go(1);
+              else go(-1);
+            }
+          }
+        }
+      }
+
+      stage.addEventListener("pointerup", endPointer);
+      stage.addEventListener("pointercancel", endPointer);
+      stage.addEventListener("pointerleave", function (e) {
+        if (pointers.has(e.pointerId)) endPointer(e);
+      });
+
+      // PC: ホイールで拡大
+      stage.addEventListener(
+        "wheel",
+        function (e) {
+          e.preventDefault();
+          var factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
+          setZoomAt(scale * factor, e.clientX, e.clientY, false);
+        },
+        { passive: false }
+      );
+
+      btnPrev.addEventListener("click", function () {
+        if (scale > 1.01) {
+          resetZoom(true);
+          return;
+        }
+        go(-1);
+      });
+      btnNext.addEventListener("click", function () {
+        if (scale > 1.01) {
+          resetZoom(true);
+          return;
+        }
+        go(1);
+      });
 
       document.addEventListener("keydown", function (e) {
+        if (e.key === "Escape" && scale > 1.01) {
+          e.preventDefault();
+          resetZoom(true);
+          return;
+        }
+        if (scale > 1.01) return;
+
         if (e.key === "ArrowLeft" || e.key === "PageUp") {
           e.preventDefault();
           go(-1);
@@ -313,39 +593,20 @@
         }
       });
 
-      // スワイプ（モバイル）
-      var touchStartX = 0;
-      var touchStartY = 0;
-      var stage = document.getElementById("stage");
-      stage.addEventListener(
-        "touchstart",
-        function (e) {
-          if (!e.changedTouches || !e.changedTouches[0]) return;
-          touchStartX = e.changedTouches[0].clientX;
-          touchStartY = e.changedTouches[0].clientY;
-        },
-        { passive: true }
-      );
-      stage.addEventListener(
-        "touchend",
-        function (e) {
-          if (!e.changedTouches || !e.changedTouches[0]) return;
-          var dx = e.changedTouches[0].clientX - touchStartX;
-          var dy = e.changedTouches[0].clientY - touchStartY;
-          if (Math.abs(dx) < 50 || Math.abs(dx) < Math.abs(dy)) return;
-          if (dx < 0) go(1);
-          else go(-1);
-        },
-        { passive: true }
-      );
-
-      window.addEventListener("resize", detectDevice);
-      window.addEventListener("orientationchange", detectDevice);
+      window.addEventListener("resize", function () {
+        detectDevice();
+        clampPan();
+        applyTransform(false);
+      });
+      window.addEventListener("orientationchange", function () {
+        detectDevice();
+        resetZoom(false);
+      });
 
       detectDevice();
       update();
+      showZoomHintBriefly();
 
-      // 全スライドを裏で先読み（回線が許す範囲）
       for (var i = 1; i <= TOTAL; i++) preload(i);
     })();
   </script>
